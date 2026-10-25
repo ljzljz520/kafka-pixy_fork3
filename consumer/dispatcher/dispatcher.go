@@ -180,6 +180,14 @@ func (d *T) run() {
 				d.actDesc.Log().Info("Shutting down")
 				goto wrapup
 			}
+			// Requests that are already terminal must be dropped before any
+			// group/topic child node is looked up or spawned for them, so they
+			// neither occupy a queued slot nor keep downstream machinery alive.
+			if err := rq.Context().Err(); err != nil {
+				d.actDesc.Log().Warnf("Discarding canceled request: %+v, err=%v", rq, err)
+				rq.ResponseCh <- consumer.CanceledResponse(err)
+				continue
+			}
 			key := d.factory.KeyOf(rq)
 			childRequestsCh := d.children[key]
 			// If there is no child for the key, then spawn one.
@@ -197,10 +205,18 @@ func (d *T) run() {
 			// pulling too aggressively or the Kafka is experiencing issues.
 			// Either way we reject requests right away and callers are
 			// expected to back off for awhile and repeat their request later.
+			// But if the request got canceled while waiting for buffer space
+			// then report the cancellation instead, so the caller is not billed
+			// an overflow rejection for a request it no longer cares about.
 			select {
 			case childRequestsCh <- rq:
 			default:
-				rq.ResponseCh <- rsTooManyRequests
+				select {
+				case <-rq.Context().Done():
+					rq.ResponseCh <- consumer.CanceledResponse(rq.Context().Err())
+				default:
+					rq.ResponseCh <- rsTooManyRequests
+				}
 			}
 
 		case key := <-d.disposalCh:

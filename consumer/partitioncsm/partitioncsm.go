@@ -170,6 +170,7 @@ func (pc *T) runFetchLoop() bool {
 	var (
 		nilOrMsgInCh  = mf.Messages()
 		nilOrMsgOutCh chan consumer.Message
+		nilOrResetCh  chan struct{}
 		retryTicker   = time.NewTicker(check4RetryInterval)
 		msg           consumer.Message
 		msgOk         bool
@@ -189,8 +190,10 @@ func (pc *T) runFetchLoop() bool {
 				continue
 			}
 			msg.EventsCh = pc.eventsCh
+			msg.ResetCh = make(chan struct{}, 1)
 			pc.notifyTestFetched()
 			nilOrMsgOutCh = pc.messagesCh
+			nilOrResetCh = msg.ResetCh
 			// Stop fetching messages until this one is offered to a client.
 			nilOrMsgInCh = nil
 
@@ -201,9 +204,23 @@ func (pc *T) runFetchLoop() bool {
 			if msg, msgOk = pc.nextRetry(); msgOk {
 				nilOrMsgInCh = nil
 				nilOrMsgOutCh = pc.messagesCh
+				nilOrResetCh = msg.ResetCh
 			}
 		case nilOrMsgOutCh <- msg:
 			nilOrMsgOutCh = nil
+
+		// A request reserved this record but lost to cancellation before the
+		// handoff. The record was never reported as EvOffered, so the offset
+		// tracker has no state for it. Make the very same record deliverable
+		// again: re-arm the output and keep the fetcher paused until it is
+		// offered this time. The per-record signal is drained by this
+		// receive, so it can fire again later if the redelivered record is
+		// reserved and canceled once more.
+		case <-nilOrResetCh:
+			if !msgOk {
+				continue
+			}
+			nilOrMsgOutCh = pc.messagesCh
 
 		case event := <-pc.eventsCh:
 			switch event.T {
@@ -216,8 +233,10 @@ func (pc *T) runFetchLoop() bool {
 				atomic.StoreInt32(&pc.offerCount, int32(offerCount))
 				if msg, msgOk = pc.nextRetry(); msgOk {
 					nilOrMsgOutCh = pc.messagesCh
+					nilOrResetCh = msg.ResetCh
 					continue
 				}
+				nilOrResetCh = nil
 				if offerCount > pc.cfg.Consumer.MaxPendingMessages {
 					pc.actDesc.Log().Warnf("Offer count above HWM: %d", offerCount)
 					nilOrMsgInCh = nil

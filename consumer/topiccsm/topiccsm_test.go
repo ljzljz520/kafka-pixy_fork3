@@ -310,6 +310,7 @@ func newMessage(idx int) (consumer.Message, chan consumer.Event) {
 	msg.Value = []byte{byte(idx)}
 	msg.Offset = int64(1000 + idx)
 	msg.EventsCh = eventsCh
+	msg.ResetCh = make(chan struct{}, 1)
 	return msg, eventsCh
 }
 

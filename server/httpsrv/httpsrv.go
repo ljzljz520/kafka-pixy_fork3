@@ -309,24 +309,12 @@ func (s *T) handleConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	consMsg, err := pxy.Consume(group, topic, ack)
+	// The request context is canceled by net/http as soon as the client
+	// disconnects, so propagating it lets the whole consume pipeline release
+	// promptly instead of waiting for the long polling timeout.
+	consMsg, err := pxy.Consume(r.Context(), group, topic, ack)
 	if err != nil {
-		var status int
-		switch err {
-		case consumer.ErrRequestTimeout:
-			status = http.StatusRequestTimeout
-		case consumer.ErrTooManyRequests:
-			status = http.StatusTooManyRequests
-		case consumer.ErrUnavailable:
-			fallthrough
-		case proxy.ErrDisabled:
-			fallthrough
-		case proxy.ErrUnavailable:
-			status = http.StatusServiceUnavailable
-		default:
-			status = http.StatusInternalServerError
-		}
-		s.respondWithJSON(w, status, errorRs{err.Error()})
+		s.respondWithJSON(w, consumeHTTPStatus(err), errorRs{err.Error()})
 		return
 	}
 
@@ -345,6 +333,35 @@ func (s *T) handleConsume(w http.ResponseWriter, r *http.Request) {
 		Offset:    consMsg.Offset,
 		Headers:   headers,
 	})
+}
+
+// statusClientClosedRequest is the nginx convention for "the client closed the
+// request before the server answered". It is used when a consume request is
+// canceled by its caller (e.g. TCP disconnect) before a message is handed
+// off. In practice the response is usually not deliverable in that case
+// anyway.
+const statusClientClosedRequest = 499
+
+// consumeHTTPStatus maps consume-layer errors to HTTP response status codes.
+func consumeHTTPStatus(err error) int {
+	switch err {
+	case consumer.ErrRequestCanceled:
+		return statusClientClosedRequest
+	case consumer.ErrRequestDeadline:
+		return http.StatusGatewayTimeout
+	case consumer.ErrRequestTimeout:
+		return http.StatusRequestTimeout
+	case consumer.ErrTooManyRequests:
+		return http.StatusTooManyRequests
+	case consumer.ErrUnavailable:
+		fallthrough
+	case proxy.ErrDisabled:
+		fallthrough
+	case proxy.ErrUnavailable:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // handleConsume is an HTTP request handler for `GET /topic/{topic}/messages`

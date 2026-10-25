@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -217,16 +218,32 @@ func (p *T) AsyncProduce(topic string, key, message sarama.Encoder, headers []sa
 // `Config.Consumer.LongPollingTimeout`. If no new message is produced during
 // that time, then `ErrRequestTimeout` is returned.
 //
+// If ctx is canceled or its deadline expires before a message handoff is
+// committed then the request is terminated with
+// consumer.ErrRequestCanceled/consumer.ErrRequestDeadline: no message is
+// offered or auto-acknowledged on its behalf. A handoff that wins the race is
+// still completed and the normal noAck/explicit Ack/autoAck rules apply.
+//
 // Note that during state transitions topic subscribe<->unsubscribe and
 // consumer group register<->deregister the method may return either
 // `ErrBufferOverflow` or `ErrRequestTimeout` even when there are messages
 // available for consumption. In that case the user should back off a bit
 // and then repeat the request.
-func (p *T) Consume(group, topic string, ack Ack) (consumer.Message, error) {
+//
+// An explicit ack carried along with the request acknowledges the PREVIOUS
+// message. It is dispatched independently of the pull, therefore canceling
+// the pull never revokes an ack that was already accepted.
+func (p *T) Consume(ctx context.Context, group, topic string, ack Ack) (consumer.Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if p.cfg.Consumer.Disabled {
 		return consumer.Message{}, ErrDisabled
 	}
 
+	// Dispatch the explicit ack of the previous message independently from
+	// the pull below. Cancellation of this request's context must not revoke
+	// an ack accepted for the previously handed-off message.
 	if ack != noAck && ack != autoAck {
 		p.eventsChMapMu.RLock()
 		eventsChID := eventsChID{group, topic, ack.partition}
@@ -252,10 +269,13 @@ func (p *T) Consume(group, topic string, ack Ack) (consumer.Message, error) {
 		p.consumerMu.RUnlock()
 		return consumer.Message{}, ErrUnavailable
 	}
-	responseCh := p.consumer.AsyncConsume(group, topic)
+	responseCh := p.consumer.AsyncConsumeCtx(ctx, group, topic)
 	p.consumerMu.RUnlock()
 
-	rs := <-responseCh
+	rs, handedOff := receiveResponse(responseCh, ctx)
+	if !handedOff {
+		return consumer.Message{}, consumer.CanceledResponse(ctx.Err()).Err
+	}
 	if rs.Err != nil {
 		return consumer.Message{}, rs.Err
 	}
@@ -269,6 +289,27 @@ func (p *T) Consume(group, topic string, ack Ack) (consumer.Message, error) {
 		rs.Msg.EventsCh <- consumer.Ack(rs.Msg.Offset)
 	}
 	return rs.Msg, nil
+}
+
+// receiveResponse waits for a consume response honoring ctx. It defines the
+// proxy-level tie-break between a completed handoff and an observed
+// cancellation: a response that has already arrived (or is selectable at the
+// instant the context becomes done) wins; otherwise the cancellation wins.
+// Because the downstream topic consumer makes the very same context check at
+// its arbitration point before committing a handoff, no message response can
+// arrive after a strict cancellation for the same request.
+func receiveResponse(rsCh <-chan consumer.Response, ctx context.Context) (consumer.Response, bool) {
+	select {
+	case rs := <-rsCh:
+		return rs, true
+	case <-ctx.Done():
+		select {
+		case rs := <-rsCh:
+			return rs, true
+		default:
+			return consumer.Response{}, false
+		}
+	}
 }
 
 func (p *T) Ack(group, topic string, ack Ack) error {

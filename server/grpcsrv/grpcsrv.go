@@ -143,22 +143,9 @@ func (s *T) ConsumeNAck(ctx context.Context, req *pb.ConsNAckRq) (*pb.ConsRs, er
 		}
 	}
 
-	consMsg, err := pxy.Consume(req.Group, req.Topic, ack)
+	consMsg, err := pxy.Consume(ctx, req.Group, req.Topic, ack)
 	if err != nil {
-		switch err {
-		case consumer.ErrRequestTimeout:
-			return nil, status.Errorf(codes.NotFound, err.Error())
-		case consumer.ErrTooManyRequests:
-			return nil, status.Errorf(codes.ResourceExhausted, err.Error())
-		case consumer.ErrUnavailable:
-			fallthrough
-		case proxy.ErrDisabled:
-			fallthrough
-		case proxy.ErrUnavailable:
-			return nil, status.Errorf(codes.Unavailable, err.Error())
-		default:
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
+		return nil, mapConsumeError(err)
 	}
 	res := pb.ConsRs{
 		Partition: consMsg.Partition,
@@ -177,6 +164,31 @@ func (s *T) ConsumeNAck(ctx context.Context, req *pb.ConsNAckRq) (*pb.ConsRs, er
 		res.KeyValue = consMsg.Key
 	}
 	return &res, nil
+}
+
+// mapConsumeError converts consume-layer errors into gRPC status errors. In
+// particular a client-side cancellation maps to codes.Canceled and an expired
+// caller deadline maps to codes.DeadlineExceeded, so that gRPC clients can
+// react to them distinctly from server timeouts and backpressure.
+func mapConsumeError(err error) error {
+	switch err {
+	case consumer.ErrRequestCanceled:
+		return status.Error(codes.Canceled, err.Error())
+	case consumer.ErrRequestDeadline:
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	case consumer.ErrRequestTimeout:
+		return status.Error(codes.NotFound, err.Error())
+	case consumer.ErrTooManyRequests:
+		return status.Error(codes.ResourceExhausted, err.Error())
+	case consumer.ErrUnavailable:
+		fallthrough
+	case proxy.ErrDisabled:
+		fallthrough
+	case proxy.ErrUnavailable:
+		return status.Error(codes.Unavailable, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
+	}
 }
 
 func (s *T) Ack(ctx context.Context, req *pb.AckRq) (*pb.AckRs, error) {

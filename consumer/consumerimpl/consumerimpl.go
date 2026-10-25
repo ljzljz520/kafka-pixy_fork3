@@ -1,6 +1,8 @@
 package consumerimpl
 
 import (
+	"context"
+
 	"github.com/Shopify/sarama"
 	"github.com/mailgun/kafka-pixy/actor"
 	"github.com/mailgun/kafka-pixy/config"
@@ -59,13 +61,23 @@ func Spawn(parentActDesc *actor.Descriptor, cfg *config.Proxy, offsetMgrF offset
 
 // implements `consumer.T`
 func (c *t) Consume(group, topic string) (consumer.Message, error) {
-	rs := <-c.AsyncConsume(group, topic)
+	return c.ConsumeCtx(context.Background(), group, topic)
+}
+
+// implements `consumer.T`
+func (c *t) ConsumeCtx(ctx context.Context, group, topic string) (consumer.Message, error) {
+	rs := <-c.AsyncConsumeCtx(ctx, group, topic)
 	return rs.Msg, rs.Err
 }
 
 // implements `consumer.T`
 func (c *t) AsyncConsume(group, topic string) <-chan consumer.Response {
-	rq := consumer.NewRequest(group, topic)
+	return c.AsyncConsumeCtx(context.Background(), group, topic)
+}
+
+// implements `consumer.T`
+func (c *t) AsyncConsumeCtx(ctx context.Context, group, topic string) <-chan consumer.Response {
+	rq := consumer.NewRequestCtx(ctx, group, topic)
 	c.dispatcher.Requests() <- rq
 	return rq.ResponseCh
 }
